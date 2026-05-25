@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+#
+# archive-git v2.0
+#
+# Create a long-term, bit-rot resistant archive of a git repository.
+#
+# Usage: archive-git <directory>
+#
+# Produces in the current working directory:
+#   <name>-archive.tar              the archive (contains bundle + manifest + checksums)
+#   <name>-archive.tar.par2         par2 recovery index
+#   <name>-archive.tar.vol*.par2    par2 recovery data (20% redundancy)
+#   <name>-archive.tar.sha256       SHA-256 of the .tar (quick external check)
+#
+# After creation, the archive is verified end-to-end by restoring it in a
+# private temporary directory and comparing refs against the source.
+
+set -euo pipefail
+
+# ============================================================
+# Constants
+# ============================================================
+
+readonly SCRIPT_VERSION="2.0"
+readonly PAR2_REDUNDANCY=20      # percent
+readonly XZ_LEVEL=9
+readonly REPACK_DEPTH=250
+readonly REPACK_WINDOW=250
+readonly TMPDIR_MULTIPLIER=5     # tmp space needed, relative to .git size
+readonly OUTPUT_MULTIPLIER=2     # output space needed, relative to .git size
+
+# ============================================================
+# Helpers
+# ============================================================
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <directory>
+
+Creates a bit-rot resistant archive of the git repository in <directory>.
+Output files are written to the current working directory. The archive is
+verified end-to-end after creation.
+
+Produces:
+  <name>-archive.tar              the archive
+  <name>-archive.tar.par2         par2 recovery index
+  <name>-archive.tar.vol*.par2    par2 recovery data (${PAR2_REDUNDANCY}% redundancy)
+  <name>-archive.tar.sha256       SHA-256 of the .tar
+EOF
+}
+
+err()  { echo "Error: $*" >&2; }
+warn() { echo "Warning: $*" >&2; }
+info() { echo "$*"; }
+
+# Sanitize a string for safe use as a file name component.
+# - Replace any char outside [A-Za-z0-9._-] with underscore.
+# - Prefix with underscore if the result starts with '-' or '.'.
+sanitize_name() {
+    local name="$1"
+    name="${name//[^A-Za-z0-9._-]/_}"
+    [[ "$name" =~ ^[-.] ]] && name="_${name}"
+    [[ -z "$name" ]] && name="repo"
+    printf '%s' "$name"
+}
+
+human_bytes() {
+    numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "${1}B"
+}
+
+tool_version() {
+    case "$1" in
+        git)        git --version 2>/dev/null | awk '{print $3}' ;;
+        xz)         xz --version 2>/dev/null | head -1 | awk '{print $4}' ;;
+        par2)       dpkg-query -W -f='${Version}' par2 2>/dev/null || echo unknown ;;
+        tar)        tar --version 2>/dev/null | head -1 | awk '{print $4}' ;;
+        sha256sum|sha512sum)
+                    sha256sum --version 2>/dev/null | head -1 | awk '{print $NF}' ;;
+        b3sum)      b3sum --version 2>/dev/null | awk '{print $2}' ;;
+        *)          echo unknown ;;
+    esac
+}
+
+# ============================================================
+# Argument parsing
+# ============================================================
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 1
+fi
+
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+TARGET_DIR="$1"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+    err "'$TARGET_DIR' is not a directory"
+    exit 1
+fi
+
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
+
+# ============================================================
+# Preflight: required tools
+# ============================================================
+
+MISSING=()
+for tool in git xz par2 tar sha256sum sha512sum b3sum mktemp dpkg-query numfmt; do
+    command -v "$tool" >/dev/null 2>&1 || MISSING+=("$tool")
+done
+
+if (( ${#MISSING[@]} > 0 )); then
+    err "missing required tools: ${MISSING[*]}"
+    err "on Ubuntu, install with: sudo apt install xz-utils par2 b3sum coreutils"
+    exit 1
+fi
+
+# ============================================================
+# Preflight: target must be a git repo
+# ============================================================
+
+if ! git -C "$TARGET_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    err "'$TARGET_DIR' does not contain a git repository"
+    exit 1
+fi
+
+GIT_DIR_PATH="$(git -C "$TARGET_DIR" rev-parse --absolute-git-dir)"
+
+# ============================================================
+# Naming & output paths (sanitized)
+# ============================================================
+
+RAW_REPO_NAME="$(basename "$TARGET_DIR")"
+REPO_NAME="$(sanitize_name "$RAW_REPO_NAME")"
+
+if [[ -z "$REPO_NAME" || "$REPO_NAME" == "_" ]]; then
+    err "could not derive a sensible repo name from '$TARGET_DIR'"
+    exit 1
+fi
+
+if [[ "$REPO_NAME" != "$RAW_REPO_NAME" ]]; then
+    warn "repo name sanitized: '$RAW_REPO_NAME' -> '$REPO_NAME'"
+fi
+
+OUTPUT_DIR="$(pwd)"
+ARCHIVE_NAME="${REPO_NAME}-archive.tar"
+ARCHIVE_PATH="${OUTPUT_DIR}/${ARCHIVE_NAME}"
+SHA_PATH="${OUTPUT_DIR}/${ARCHIVE_NAME}.sha256"
+
+# Output dir must be writable
+if [[ ! -w "$OUTPUT_DIR" ]]; then
+    err "current directory is not writable: $OUTPUT_DIR"
+    exit 1
+fi
+
+# Refuse to overwrite anything: .tar, .sha256, or any .par2 sidecar.
+EXISTING=()
+[[ -e "$ARCHIVE_PATH" ]] && EXISTING+=("$ARCHIVE_PATH")
+[[ -e "$SHA_PATH"     ]] && EXISTING+=("$SHA_PATH")
+shopt -s nullglob
+for f in "${OUTPUT_DIR}/${ARCHIVE_NAME}"*.par2; do
+    EXISTING+=("$f")
+done
+shopt -u nullglob
+
+if (( ${#EXISTING[@]} > 0 )); then
+    err "output file(s) already exist; refusing to overwrite:"
+    printf '  %s\n' "${EXISTING[@]}" >&2
+    exit 1
+fi
+
+# ============================================================
+# Preflight: filesystem space
+# ============================================================
+
+REPO_SIZE_BYTES=$(du -sb "$GIT_DIR_PATH" | awk '{print $1}')
+TMPDIR_REAL="${TMPDIR:-/tmp}"
+
+TMP_AVAIL=$(df -B1 --output=avail "$TMPDIR_REAL" 2>/dev/null | tail -1)
+OUT_AVAIL=$(df -B1 --output=avail "$OUTPUT_DIR"  2>/dev/null | tail -1)
+
+TMP_NEEDED=$((REPO_SIZE_BYTES * TMPDIR_MULTIPLIER))
+OUT_NEEDED=$((REPO_SIZE_BYTES * OUTPUT_MULTIPLIER))
+
+if (( TMP_AVAIL < TMP_NEEDED )); then
+    err "insufficient space in $TMPDIR_REAL"
+    err "  available:       $(human_bytes "$TMP_AVAIL")"
+    err "  estimated need:  $(human_bytes "$TMP_NEEDED") (${TMPDIR_MULTIPLIER}x the .git directory)"
+    err "  hint: set TMPDIR=/some/larger/path and re-run"
+    exit 1
+fi
+
+if (( OUT_AVAIL < OUT_NEEDED )); then
+    err "insufficient space in $OUTPUT_DIR"
+    err "  available:       $(human_bytes "$OUT_AVAIL")"
+    err "  estimated need:  $(human_bytes "$OUT_NEEDED") (${OUTPUT_MULTIPLIER}x the .git directory)"
+    err "  hint: cd to a directory with more free space"
+    exit 1
+fi
+
+# ============================================================
+# Detect LFS and submodules (warn at the end if present)
+# ============================================================
+
+LFS_DETECTED=no
+if [[ -d "${GIT_DIR_PATH}/lfs" ]]; then
+    LFS_DETECTED=yes
+elif git -C "$TARGET_DIR" grep --quiet --cached "filter=lfs" -- '*.gitattributes' 2>/dev/null; then
+    LFS_DETECTED=yes
+fi
+
+SUBMODULES_DETECTED=no
+if git -C "$TARGET_DIR" cat-file -e HEAD:.gitmodules 2>/dev/null \
+   || [[ -f "${TARGET_DIR}/.gitmodules" ]]; then
+    SUBMODULES_DETECTED=yes
+fi
+
+# ============================================================
+# Private temp workspace + safe cleanup
+# (trap installed BEFORE mktemp to close the race window)
+# ============================================================
+
+WORK_DIR=""
+cleanup() {
+    local rc=$?
+    if [[ -n "${WORK_DIR:-}" \
+          && -d "$WORK_DIR" \
+          && "$WORK_DIR" == */archive-git.* ]]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+WORK_DIR="$(mktemp -d -t archive-git.XXXXXXXX)"
+BUILD_DIR="${WORK_DIR}/build"
+VERIFY_DIR="${WORK_DIR}/verify"
+mkdir -p "$BUILD_DIR" "$VERIFY_DIR"
+
+# ============================================================
+# Banner
+# ============================================================
+
+info "==> archive-git v${SCRIPT_VERSION}"
+info "    Source repo:       $TARGET_DIR"
+info "    Source .git size:  $(human_bytes "$REPO_SIZE_BYTES")"
+info "    Output directory:  $OUTPUT_DIR"
+info "    Temp workspace:    $WORK_DIR"
+info "    LFS detected:      $LFS_DETECTED"
+info "    Submodules:        $SUBMODULES_DETECTED"
+info ""
+
+# ============================================================
+# [1/8] Source repository integrity check
+# ============================================================
+
+info "==> [1/8] Checking source repository integrity (git fsck)"
+git -C "$TARGET_DIR" fsck --full --no-dangling
+info ""
+
+# ============================================================
+# [2/8] Mirror clone (no hardlinks) + aggressive repack
+# ============================================================
+
+info "==> [2/8] Creating mirror clone (no hardlinks) and repacking aggressively"
+git clone --mirror --no-hardlinks --quiet "$TARGET_DIR" "${BUILD_DIR}/mirror.git"
+git -C "${BUILD_DIR}/mirror.git" config pack.compression 9
+git -C "${BUILD_DIR}/mirror.git" repack -adf \
+    --depth="$REPACK_DEPTH" --window="$REPACK_WINDOW" --quiet
+info ""
+
+# ============================================================
+# [3/8] Bundle + capture refs
+# ============================================================
+
+info "==> [3/8] Creating git bundle and capturing ref snapshot"
+git -C "${BUILD_DIR}/mirror.git" bundle create "${BUILD_DIR}/repo.bundle" --all >/dev/null
+git -C "${BUILD_DIR}/mirror.git" bundle verify "${BUILD_DIR}/repo.bundle" >/dev/null
+
+# Deterministic ref snapshot for later comparison.
+git -C "${BUILD_DIR}/mirror.git" for-each-ref \
+    --format='%(refname) %(objectname)' \
+    --sort=refname > "${BUILD_DIR}/REFS.txt"
+
+REF_COUNT=$(wc -l < "${BUILD_DIR}/REFS.txt" | awk '{print $1}')
+HEAD_REF=$(git -C "${BUILD_DIR}/mirror.git" symbolic-ref HEAD 2>/dev/null || echo "(detached)")
+
+COMMIT_COUNT="(unknown)"
+if git -C "${BUILD_DIR}/mirror.git" rev-list --count --all >/dev/null 2>&1; then
+    COMMIT_COUNT=$(git -C "${BUILD_DIR}/mirror.git" rev-list --count --all)
+fi
+
+OBJECT_COUNT="(unknown)"
+if OC_RAW=$(git -C "${BUILD_DIR}/mirror.git" count-objects -v 2>/dev/null); then
+    OBJECT_COUNT=$(echo "$OC_RAW" | awk '/^in-pack:/{print $2}')
+fi
+
+info "    Refs:    $REF_COUNT  (HEAD -> $HEAD_REF)"
+info "    Commits: $COMMIT_COUNT"
+info "    Objects: $OBJECT_COUNT"
+info ""
+
+# ---------- hash the uncompressed bundle (for the manifest) ----------
+
+BUNDLE_SIZE=$(stat -c%s "${BUILD_DIR}/repo.bundle")
+BUNDLE_SHA256=$(sha256sum "${BUILD_DIR}/repo.bundle" | awk '{print $1}')
+BUNDLE_SHA512=$(sha512sum "${BUILD_DIR}/repo.bundle" | awk '{print $1}')
+BUNDLE_B3=$(b3sum     "${BUILD_DIR}/repo.bundle" | awk '{print $1}')
+
+# ============================================================
+# [4/8] Compress with xz
+# ============================================================
+
+info "==> [4/8] Compressing bundle with xz -${XZ_LEVEL} -e (this is the slow step)"
+xz -"${XZ_LEVEL}" -e --threads=0 "${BUILD_DIR}/repo.bundle"
+
+BUNDLE_XZ_SIZE=$(stat -c%s "${BUILD_DIR}/repo.bundle.xz")
+BUNDLE_XZ_SHA256=$(sha256sum "${BUILD_DIR}/repo.bundle.xz" | awk '{print $1}')
+BUNDLE_XZ_SHA512=$(sha512sum "${BUILD_DIR}/repo.bundle.xz" | awk '{print $1}')
+BUNDLE_XZ_B3=$(b3sum     "${BUILD_DIR}/repo.bundle.xz" | awk '{print $1}')
+
+info "    Bundle uncompressed: $(human_bytes "$BUNDLE_SIZE")"
+info "    Bundle compressed:   $(human_bytes "$BUNDLE_XZ_SIZE")"
+info ""
+
+# ============================================================
+# [5/8] Manifest + per-file checksums
+# ============================================================
+
+info "==> [5/8] Writing MANIFEST.txt and per-file checksums"
+
+CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+HOSTNAME_VAL="$(hostname 2>/dev/null || echo unknown)"
+USERNAME_VAL="$(id -un 2>/dev/null || echo unknown)"
+
+GIT_VER=$(tool_version git)
+XZ_VER=$(tool_version xz)
+PAR2_VER=$(tool_version par2)
+TAR_VER=$(tool_version tar)
+SHA256_VER=$(tool_version sha256sum)
+B3SUM_VER=$(tool_version b3sum)
+
+cat > "${BUILD_DIR}/MANIFEST.txt" <<EOF
+================================================================
+GIT REPOSITORY ARCHIVE MANIFEST
+================================================================
+
+This file documents the contents and origin of the accompanying
+git repository archive. It is intended to make the archive
+self-describing for long-term storage.
+
+----------------------------------------------------------------
+ARCHIVE METADATA
+----------------------------------------------------------------
+
+archive-git version:    ${SCRIPT_VERSION}
+Created (UTC):          ${CREATED_AT}
+Created on host:        ${HOSTNAME_VAL}
+Created by user:        ${USERNAME_VAL}
+
+Source repo name:       ${REPO_NAME}
+Original source path:   ${TARGET_DIR}
+Source .git size:       ${REPO_SIZE_BYTES} bytes ($(human_bytes "$REPO_SIZE_BYTES"))
+
+HEAD:                   ${HEAD_REF}
+Total refs:             ${REF_COUNT}
+Total commits (all):    ${COMMIT_COUNT}
+Total objects (packed): ${OBJECT_COUNT}
+
+git-lfs detected:       ${LFS_DETECTED}
+Submodules detected:    ${SUBMODULES_DETECTED}
+
+----------------------------------------------------------------
+TOOL VERSIONS USED
+----------------------------------------------------------------
+
+git:        ${GIT_VER}
+xz:         ${XZ_VER}
+par2:       ${PAR2_VER}
+tar:        ${TAR_VER}
+sha256sum:  ${SHA256_VER}    (also used: sha512sum)
+b3sum:      ${B3SUM_VER}
+
+----------------------------------------------------------------
+ARCHIVE LAYOUT
+----------------------------------------------------------------
+
+Outside the tar (these files MUST be kept together):
+
+  ${ARCHIVE_NAME}              The archive itself
+  ${ARCHIVE_NAME}.par2         par2 recovery index
+  ${ARCHIVE_NAME}.vol*.par2    par2 recovery data (${PAR2_REDUNDANCY}% redundancy)
+  ${ARCHIVE_NAME}.sha256       SHA-256 of the .tar (for a quick check)
+
+Inside the tar:
+
+  repo.bundle.xz   LZMA2-compressed git bundle (--all refs)
+  MANIFEST.txt     This file
+  REFS.txt         Snapshot of all refs at archive time
+  SHA256SUMS       SHA-256 of every file inside the tar
+  SHA512SUMS       SHA-512 of every file inside the tar
+  B3SUMS           BLAKE3  of every file inside the tar
+
+----------------------------------------------------------------
+HASHES OF KEY FILES
+----------------------------------------------------------------
+
+repo.bundle (uncompressed bundle, after step 6 of recovery)
+  size:     ${BUNDLE_SIZE} bytes
+  SHA-256:  ${BUNDLE_SHA256}
+  SHA-512:  ${BUNDLE_SHA512}
+  BLAKE3:   ${BUNDLE_B3}
+
+repo.bundle.xz (compressed bundle, as stored inside the tar)
+  size:     ${BUNDLE_XZ_SIZE} bytes
+  SHA-256:  ${BUNDLE_XZ_SHA256}
+  SHA-512:  ${BUNDLE_XZ_SHA512}
+  BLAKE3:   ${BUNDLE_XZ_B3}
+
+----------------------------------------------------------------
+RECOVERY INSTRUCTIONS
+----------------------------------------------------------------
+
+Required tools: git, xz-utils, par2, coreutils, b3sum
+On Ubuntu / Debian:
+    sudo apt install git xz-utils par2 b3sum coreutils
+
+Run the following commands in the directory containing the
+archive files.
+
+# Step 1: Verify the archive integrity using par2.
+# This checks the .tar file against the recovery data and
+# reports any bit rot or corruption.
+par2 verify ${ARCHIVE_NAME}.par2
+
+# Step 2: If par2 verify reported damage, repair it. par2 can
+# fix damage up to the redundancy limit (${PAR2_REDUNDANCY}%) provided enough
+# recovery data survived.
+par2 repair ${ARCHIVE_NAME}.par2
+
+# Step 3 (optional): Quick external SHA-256 check on the .tar.
+sha256sum -c ${ARCHIVE_NAME}.sha256
+
+# Step 4: Extract the tar archive.
+tar xf ${ARCHIVE_NAME}
+
+# Step 5: Verify the extracted files. Any single one of these
+# is sufficient; running all three provides defense against
+# any single algorithm being weakened in the future.
+sha256sum -c SHA256SUMS
+sha512sum -c SHA512SUMS
+b3sum     -c B3SUMS
+
+# Step 6: Decompress the bundle.
+xz -d repo.bundle.xz
+
+# Step 7: Verify the decompressed bundle matches this manifest.
+sha256sum repo.bundle
+# Compare against the SHA-256 of repo.bundle listed under
+# "HASHES OF KEY FILES" above.
+
+# Step 8: Restore the repository.
+git clone repo.bundle restored-repo
+cd restored-repo
+git fsck --full
+
+# 'restored-repo' is now a complete clone of the original
+# repository, with all branches, tags, and history preserved.
+
+----------------------------------------------------------------
+END OF MANIFEST
+----------------------------------------------------------------
+EOF
+
+# Per-file checksums for everything that goes into the tar
+# (excluding the checksum files themselves, which would be self-referential).
+(
+    cd "$BUILD_DIR"
+    sha256sum repo.bundle.xz MANIFEST.txt REFS.txt > SHA256SUMS
+    sha512sum repo.bundle.xz MANIFEST.txt REFS.txt > SHA512SUMS
+    b3sum     repo.bundle.xz MANIFEST.txt REFS.txt > B3SUMS
+)
+info ""
+
+# ============================================================
+# [6/8] Pack tar archive
+# ============================================================
+
+info "==> [6/8] Packing tar archive"
+(
+    cd "$BUILD_DIR"
+    tar cf "$ARCHIVE_PATH" -- \
+        repo.bundle.xz MANIFEST.txt REFS.txt SHA256SUMS SHA512SUMS B3SUMS
+)
+
+ARCHIVE_SIZE=$(stat -c%s "$ARCHIVE_PATH")
+info "    Archive size: $(human_bytes "$ARCHIVE_SIZE")"
+info ""
+
+# ============================================================
+# [7/8] par2 recovery data + external SHA-256
+# ============================================================
+
+info "==> [7/8] Generating par2 recovery data (${PAR2_REDUNDANCY}% redundancy)"
+(
+    cd "$OUTPUT_DIR"
+    par2 create -q -q -r"$PAR2_REDUNDANCY" -n1 -- "$ARCHIVE_NAME"
+)
+
+info "    Writing external SHA-256 of the .tar"
+(
+    cd "$OUTPUT_DIR"
+    sha256sum -- "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+)
+info ""
+
+# ============================================================
+# [8/8] End-to-end verification
+# ============================================================
+
+info "==> [8/8] Verifying archive end-to-end"
+
+info "    - Verifying par2 recovery data..."
+( cd "$OUTPUT_DIR" && par2 verify -q -q -- "${ARCHIVE_NAME}.par2" )
+
+info "    - Verifying external SHA-256..."
+( cd "$OUTPUT_DIR" && sha256sum -c --quiet "${ARCHIVE_NAME}.sha256" )
+
+info "    - Extracting tar into verify workspace..."
+tar xf "$ARCHIVE_PATH" -C "$VERIFY_DIR"
+
+info "    - Verifying SHA256SUMS, SHA512SUMS, B3SUMS..."
+(
+    cd "$VERIFY_DIR"
+    sha256sum -c --quiet SHA256SUMS
+    sha512sum -c --quiet SHA512SUMS
+    b3sum     -c --quiet B3SUMS
+)
+
+info "    - Decompressing bundle..."
+xz -d "${VERIFY_DIR}/repo.bundle.xz"
+
+info "    - Verifying decompressed bundle hash matches the manifest..."
+RESTORED_BUNDLE_SHA256=$(sha256sum "${VERIFY_DIR}/repo.bundle" | awk '{print $1}')
+if [[ "$RESTORED_BUNDLE_SHA256" != "$BUNDLE_SHA256" ]]; then
+    err "decompressed bundle hash mismatch!"
+    err "  expected: $BUNDLE_SHA256"
+    err "  got:      $RESTORED_BUNDLE_SHA256"
+    exit 1
+fi
+
+info "    - Mirror-cloning from restored bundle..."
+git clone --mirror --quiet "${VERIFY_DIR}/repo.bundle" "${VERIFY_DIR}/restored.git"
+
+info "    - Running git fsck on restored repo..."
+git -C "${VERIFY_DIR}/restored.git" fsck --full --no-dangling
+
+info "    - Comparing refs (archive snapshot vs restored repo)..."
+git -C "${VERIFY_DIR}/restored.git" for-each-ref \
+    --format='%(refname) %(objectname)' \
+    --sort=refname > "${VERIFY_DIR}/restored-refs.txt"
+
+if ! diff -q "${VERIFY_DIR}/REFS.txt" "${VERIFY_DIR}/restored-refs.txt" >/dev/null; then
+    err "ref set mismatch between archive snapshot and restored repo!"
+    diff "${VERIFY_DIR}/REFS.txt" "${VERIFY_DIR}/restored-refs.txt" >&2 || true
+    exit 1
+fi
+
+info "    - Last 5 commits from restored repo:"
+info ""
+if git -C "${VERIFY_DIR}/restored.git" log --oneline -5 >/dev/null 2>&1; then
+    git -C "${VERIFY_DIR}/restored.git" log --oneline -5 | sed 's/^/        /'
+else
+    info "        (repository has no commits reachable from HEAD)"
+fi
+info ""
+
+# ============================================================
+# Summary
+# ============================================================
+
+info "==> Done. Archive verified successfully."
+info ""
+info "    Archive:  $ARCHIVE_PATH ($(human_bytes "$ARCHIVE_SIZE"))"
+
+shopt -s nullglob
+for f in "${OUTPUT_DIR}/${ARCHIVE_NAME}"*.par2; do
+    info "    Par2:     $f ($(human_bytes "$(stat -c%s "$f")"))"
+done
+shopt -u nullglob
+info "    SHA-256:  $SHA_PATH"
+info ""
+
+if [[ "$LFS_DETECTED" == "yes" ]]; then
+    warn "================================================================"
+    warn "git-lfs was detected in this repository."
+    warn ""
+    warn "The bundle contains LFS pointer files but NOT the LFS-tracked"
+    warn "blob content itself (which lives in a separate object store)."
+    warn ""
+    warn "To preserve LFS content you should also archive the LFS"
+    warn "objects directory separately:"
+    warn "    ${GIT_DIR_PATH}/lfs/"
+    warn "or fetch all LFS objects before archiving:"
+    warn "    (cd $TARGET_DIR && git lfs fetch --all)"
+    warn "================================================================"
+fi
+
+if [[ "$SUBMODULES_DETECTED" == "yes" ]]; then
+    warn "================================================================"
+    warn "Submodules were detected in this repository (.gitmodules)."
+    warn ""
+    warn "This archive contains only the parent repository. Each submodule"
+    warn "is a separate repository that must be archived individually with"
+    warn "archive-git from its own checkout."
+    warn "================================================================"
+fi
